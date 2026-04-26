@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Data files (knowledge base)
+data/private/
+
+# Vector database
+storage/vector_db/
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment
+.env
+.env.*
+.env.local
+**/.env
+**/.env.*
+!.env.example
+!**/.env.example
+
+# Local auth and generated storage
+storage/
+backend/storage/
+!storage/.gitkeep
+!backend/storage/.gitkeep
+
+# Logs
+*.log
