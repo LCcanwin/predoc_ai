@@ -15,7 +15,19 @@ import logging
 from langchain_core.messages import AIMessage, HumanMessage
 
 from ..config import VECTOR_STORE_PATH
-from ..auth import append_memory_event, get_current_user, get_memory_context
+from ..auth import (
+    append_experience_event,
+    append_memory_event,
+    get_consultation_records,
+    get_current_user,
+)
+from ..agents.message_queue import UserMessageQueue
+from ..agents.memory_agent import (
+    build_memory_message,
+    enrich_intention_info,
+    hydrate_symptoms_from_memory,
+    load_user_memory,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -26,6 +38,7 @@ router = APIRouter(prefix="/api/consultation", tags=["consultation"])
 _sessions: Dict[str, dict] = {}
 _executor = ThreadPoolExecutor(max_workers=4)
 _retriever = None
+_message_queue = UserMessageQueue()
 
 
 def strip_think_tags(content: str) -> str:
@@ -53,7 +66,8 @@ def _get_retriever():
 async def start_consultation(request: dict, current_user: dict = Depends(get_current_user)):
     """Create a new consultation session."""
     thread_id = str(uuid.uuid4())
-    memory_context = get_memory_context(current_user["id"])
+    memory = load_user_memory(current_user["id"])
+    memory_context = memory.get("memory_context", "")
 
     session = {
         "thread_id": thread_id,
@@ -67,6 +81,7 @@ async def start_consultation(request: dict, current_user: dict = Depends(get_cur
         "intention_summary": "",
         "intention_info": {},
         "memory_context": memory_context,
+        "memory_agent": memory,
     }
 
     _sessions[thread_id] = session
@@ -76,6 +91,12 @@ async def start_consultation(request: dict, current_user: dict = Depends(get_cur
         "created_at": session["created_at"],
         "memory_context": memory_context,
     }
+
+
+@router.get("/history", response_model=dict)
+async def get_history(current_user: dict = Depends(get_current_user)):
+    """Return previous consultation records for the logged-in user."""
+    return {"records": get_consultation_records(current_user["id"])}
 
 
 def _process_turn_sync(messages: list, symptoms_list: list, thread_id: str, session_data: dict = None) -> tuple[str, str, bool, list]:
@@ -117,20 +138,24 @@ def _process_turn_sync(messages: list, symptoms_list: list, thread_id: str, sess
                 break
 
         # Step 1: Understand user intention (first turn only)
+        memory_agent = session_data.get("memory_agent") or {}
         memory_context = session_data.get("memory_context", "")
         intention_history = messages[:-1]
-        if memory_context:
-            intention_history = [AIMessage(content=f"【用户短期记忆】\n{memory_context}")] + intention_history
+        memory_message = build_memory_message(memory_agent)
+        if memory_message is not None:
+            intention_history = [memory_message] + intention_history
 
         intention = session_data.get("user_intention")
         if intention is None and user_message:
             intention, summary, info = parse_user_intention(user_message, intention_history)
+            intention, info = enrich_intention_info(intention, info, memory_agent)
             session_data["user_intention"] = intention
             session_data["intention_summary"] = summary
             session_data["intention_info"] = info
             session_data["current_phase"] = "options"
         elif intention is not None and user_message and should_reclassify_intention(user_message, intention):
             updated_intention, summary, info = parse_user_intention(user_message, intention_history)
+            updated_intention, info = enrich_intention_info(updated_intention, info, memory_agent)
             if info.get("confidence", 0) >= 0.65 and updated_intention != intention:
                 intention = updated_intention
                 session_data["user_intention"] = intention
@@ -152,7 +177,13 @@ def _process_turn_sync(messages: list, symptoms_list: list, thread_id: str, sess
                 symptoms_list.append(sym)
                 existing_dims.add(sym.get("dimension"))
 
-        all_symptoms = list(symptoms_list)
+        all_symptoms, memory_symptoms = hydrate_symptoms_from_memory(
+            symptoms_list,
+            memory_agent,
+            intention,
+        )
+        if memory_symptoms:
+            session_data["memory_hydrated_symptoms"] = memory_symptoms
 
         # Step 3: Determine response based on current phase
         response_content = ""
@@ -250,6 +281,12 @@ def _process_turn_sync(messages: list, symptoms_list: list, thread_id: str, sess
                     ])
 
                 extracted_summary = extracted_info or "【从您的描述中已提取的症状】：\n- 暂未识别到明确症状，请在下方补充选择。"
+                if memory_symptoms:
+                    memory_summary = "\n".join([
+                        f"- {item.get('dimension')}：{item.get('value')}"
+                        for item in memory_symptoms
+                    ])
+                    extracted_summary += f"\n\n【从历史记忆中带入的相关症状】：\n{memory_summary}"
                 response_content = f"""我先帮您记录当前描述，并做一次症状确认。
 
 {extracted_summary}
@@ -325,6 +362,7 @@ def _process_turn_sync(messages: list, symptoms_list: list, thread_id: str, sess
                 "intention_summary": session_data.get("intention_summary", ""),
                 "intention_info": session_data.get("intention_info", {}),
                 "memory_context": session_data.get("memory_context", ""),
+                "memory_agent": session_data.get("memory_agent", {}),
                 "retrieved_context": "",
             }
 
@@ -478,10 +516,13 @@ async def send_message(thread_id: str, request: dict, current_user: dict = Depen
 
     async def event_generator():
         try:
-            from ..graph.consultation_graph import _extract_symptoms_from_message
+            queued_message = _message_queue.enqueue(thread_id, current_user["id"], user_content)
+            next_message = _message_queue.dequeue(thread_id) or queued_message
+            session["memory_agent"] = load_user_memory(current_user["id"], next_message.content)
+            session["memory_context"] = session["memory_agent"].get("memory_context", "")
 
             # Add user message to session
-            session["messages"] = session.get("messages", []) + [HumanMessage(content=user_content)]
+            session["messages"] = session.get("messages", []) + [HumanMessage(content=next_message.content)]
 
             logger.info(f"Processing message for thread {thread_id}")
 
@@ -508,10 +549,12 @@ async def send_message(thread_id: str, request: dict, current_user: dict = Depen
             append_memory_event(
                 current_user["id"],
                 thread_id,
-                user_content,
+                next_message.content,
                 full_content,
                 all_symptoms,
             )
+            session["memory_agent"] = load_user_memory(current_user["id"], next_message.content)
+            session["memory_context"] = session["memory_agent"].get("memory_context", "")
 
             # Clean previous message content while preserving human/AI roles.
             cleaned_messages = []
@@ -574,6 +617,7 @@ async def get_case(thread_id: str, current_user: dict = Depends(get_current_user
     if not session.get("is_complete"):
         raise HTTPException(status_code=400, detail="Consultation not yet complete")
 
+    from ..agents.diagnosis_validator import validate_diagnosis_report
     from ..agents.generator_node import generate_case_text, sanitize_case_text
     from ..agents.intention_agent import IntentionType
 
@@ -590,9 +634,20 @@ async def get_case(thread_id: str, current_user: dict = Depends(get_current_user
         "intention_summary": session.get("intention_summary", ""),
         "intention_info": session.get("intention_info", {}),
         "memory_context": session.get("memory_context", ""),
+        "memory_agent": session.get("memory_agent", {}),
         "retrieved_context": "",
     }
 
     case_text = sanitize_case_text(strip_think_tags(generate_case_text(state, retriever, session.get("user_name", "匿名"))))
+    validation = validate_diagnosis_report(case_text, session.get("symptoms_list", []), session.get("messages", []))
+    if not session.get("experience_saved"):
+        append_experience_event(
+            current_user["id"],
+            thread_id,
+            session.get("symptoms_list", []),
+            case_text,
+            validation,
+        )
+        session["experience_saved"] = True
 
     return {"case": case_text}

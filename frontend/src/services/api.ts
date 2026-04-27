@@ -13,6 +13,20 @@ export interface CaseResponse {
   case: string
 }
 
+export interface ConsultationRecord {
+  thread_id: string
+  created_at?: string
+  updated_at?: string
+  symptoms: { dimension: string; value: string }[]
+  messages: {
+    user_message: string
+    assistant_summary: string
+    created_at?: string
+  }[]
+  diagnosis_summary?: string
+  validation_confidence?: number | null
+}
+
 export interface User {
   id: string
   username: string
@@ -117,6 +131,18 @@ export const api = {
 
     if (!response.ok) {
       throw new Error('Failed to get case')
+    }
+
+    return response.json()
+  },
+
+  async getHistory(token: string): Promise<{ records: ConsultationRecord[] }> {
+    const response = await fetch(`${API_BASE}/history`, {
+      headers: authHeaders(token),
+    })
+
+    if (!response.ok) {
+      throw new Error('Failed to get history')
     }
 
     return response.json()

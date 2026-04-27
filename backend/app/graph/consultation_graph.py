@@ -126,6 +126,10 @@ def run_consultation(
         "intention_summary": "",
         "intention_info": {},
         "retrieved_context": "",
+        "memory_context": "",
+        "memory_agent": {},
+        "rule_context": {},
+        "validation_context": {},
     }
 
     result = compiled_graph.invoke(initial_state)

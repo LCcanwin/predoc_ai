@@ -39,6 +39,18 @@ class AgentState(TypedDict):
     retrieved_context: str
     """Retrieved knowledge base context for current turn."""
 
+    memory_context: str
+    """Short-term user memory context for current consultation."""
+
+    memory_agent: dict
+    """Structured memory and follow-up signals."""
+
+    rule_context: dict
+    """Rule-engine diagnosis hints."""
+
+    validation_context: dict
+    """Diagnosis validation output."""
+
     # Selected options from ten inquiry
     selected_dimensions: list[str]
     """User selected dimensions from ten inquiry options."""

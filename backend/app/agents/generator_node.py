@@ -7,6 +7,9 @@ from langchain_core.messages import AIMessage
 from .state import AgentState, TEN_INQUIRY_DIMENSIONS
 from .rag_retriever import RAGRetriever
 from .intention_agent import IntentionType
+from .diagnosis_validator import append_validation_summary, validate_diagnosis_report
+from .rules_engine import build_rule_context, format_rule_context, infer_diagnosis
+from .symptom_rag_agent import retrieve_symptom_context
 from ..config import get_llm_config
 
 
@@ -112,6 +115,7 @@ def generate_case_text(state: AgentState, retriever: RAGRetriever, user_name: st
     intention_info = state.get("intention_info", {})
     memory_context = state.get("memory_context", "")
     retrieved_context = state.get("retrieved_context", "")
+    rule_context = build_rule_context(symptoms_list, messages)
 
     # Format ten inquiry section
     ten_inquiry = format_ten_inquiry_for_case(symptoms_list)
@@ -123,19 +127,8 @@ def generate_case_text(state: AgentState, retriever: RAGRetriever, user_name: st
             role = "患者" if hasattr(msg, "type") and msg.type == "human" else "助手"
             conversation_context += f"{role}：{msg.content}\n"
 
-    # Get relevant knowledge for context
-    intent_terms = {
-        IntentionType.SPECIFIC_SYMPTOM: "单一症状辨证",
-        IntentionType.QUICK_CONSULT: "快速咨询 关键辨证",
-        IntentionType.GET_PRESCRIPTION: "治法 处方建议",
-        IntentionType.FOLLOW_UP: "复诊 用药反馈",
-        IntentionType.CLARIFY_DOUBT: "辨证依据 解释",
-    }.get(user_intention, "辨证论治")
-    mentioned_terms = " ".join(intention_info.get("mentioned_symptoms", [])[:5])
-    dimension_terms = " ".join([s.get("dimension", "") for s in symptoms_list[:3]])
-    query = f"中医 {intent_terms} {mentioned_terms} {dimension_terms}".strip()
-    retrieved_docs = retriever.retrieve(query)
-    knowledge_context = retriever.format_retrieved_docs(retrieved_docs[:5])
+    # Get relevant knowledge from the symptom RAG agent.
+    _, knowledge_context = retrieve_symptom_context(state, retriever, task="generation", limit=5)
 
     # Check if this is an optimization pass
     needs_optimization = state.get("needs_optimization", False)
@@ -154,13 +147,17 @@ def generate_case_text(state: AgentState, retriever: RAGRetriever, user_name: st
 
         # Adapt generation based on intention
         if user_intention == IntentionType.QUICK_CONSULT:
-            return _generate_quick_consultation(symptoms_list, conversation_context, knowledge_context, user_name)
+            case_text = _generate_quick_consultation(symptoms_list, conversation_context, knowledge_context, user_name)
+            return _finalize_case_text(case_text, symptoms_list, messages)
         elif user_intention == IntentionType.SPECIFIC_SYMPTOM:
-            return _generate_specific_symptom_response(symptoms_list, conversation_context, knowledge_context)
+            case_text = _generate_specific_symptom_response(symptoms_list, conversation_context, knowledge_context)
+            return _finalize_case_text(case_text, symptoms_list, messages)
         elif user_intention == IntentionType.GET_PRESCRIPTION:
-            return _generate_prescription_suggestion(symptoms_list, conversation_context, knowledge_context)
+            case_text = _generate_prescription_suggestion(symptoms_list, conversation_context, knowledge_context)
+            return _finalize_case_text(case_text, symptoms_list, messages)
         elif needs_optimization:
-            return _optimize_case(symptoms_list, previous_case, knowledge_context)
+            case_text = _optimize_case(symptoms_list, previous_case, knowledge_context)
+            return _finalize_case_text(case_text, symptoms_list, messages)
 
         # Standard full case generation
         prompt = f"""作为资深中医专家，请根据以下症状信息生成一份标准化的诊断结论。
@@ -173,6 +170,9 @@ def generate_case_text(state: AgentState, retriever: RAGRetriever, user_name: st
 
 【用户短期记忆】（仅作近期背景参考，不能替代本次问诊信息）
 {memory_context if memory_context else "无"}
+
+【规则引擎参考】（用于约束辨证方向，不能替代医生判断）
+{format_rule_context(rule_context)}
 
 【相关知识库参考】
 {knowledge_context}
@@ -214,12 +214,20 @@ def generate_case_text(state: AgentState, retriever: RAGRetriever, user_name: st
 7. 不要输出 <think> 标签或任何思考过程"""
 
         response = llm.invoke(prompt)
-        return sanitize_case_text(response.content)
+        return _finalize_case_text(response.content, symptoms_list, messages)
 
     except Exception as e:
         print(f"LLM error: {e}")
         # Fallback to rule-based generation
-        return _generate_fallback_case(symptoms_list, user_name)
+        case_text = _generate_fallback_case(symptoms_list, user_name)
+        return _finalize_case_text(case_text, symptoms_list, messages)
+
+
+def _finalize_case_text(case_text: str, symptoms_list: list[dict], messages: list) -> str:
+    """Sanitize and validate final report before returning it."""
+    sanitized = sanitize_case_text(case_text)
+    validation = validate_diagnosis_report(sanitized, symptoms_list, messages)
+    return append_validation_summary(sanitized, validation)
 
 
 def _generate_quick_consultation(symptoms_list: list[dict], context: str, knowledge: str, user_name: str) -> str:
@@ -437,7 +445,7 @@ def _generate_fallback_case(symptoms_list: list[dict], user_name: str) -> str:
 
     ten_inquiry = format_ten_inquiry_for_case(symptoms_list)
 
-    differentiation, treatment_principle = _infer_diagnosis(symptoms_list)
+    differentiation, treatment_principle, _ = infer_diagnosis(symptoms_list)
 
     return CASE_TEMPLATE.format(
         name=user_name or "匿名",
@@ -450,40 +458,6 @@ def _generate_fallback_case(symptoms_list: list[dict], user_name: str) -> str:
         differentiation=differentiation,
         treatment_principle=treatment_principle,
     )
-
-
-def _infer_diagnosis(symptoms_list: list[dict]) -> tuple[str, str]:
-    """
-    Infer TCM differentiation and treatment principle from symptoms.
-    """
-    symptom_str = " ".join([
-        f"{s.get('dimension')}:{s.get('value')}"
-        for s in symptoms_list
-        if s.get("value") and s.get("value") != "未记录"
-    ])
-
-    # Simple pattern matching for common syndromes
-    if "寒热:畏寒" in symptom_str or "寒热:怕冷" in symptom_str:
-        if "汗:自汗" in symptom_str:
-            return "阳虚证", "温阳固表，益气助阳"
-        return "表寒证", "辛温解表"
-
-    if "寒热:发热" in symptom_str or "寒热:怕热" in symptom_str:
-        if "口渴:喜冷饮" in symptom_str:
-            return "实热证", "清热泻火"
-        return "阴虚证", "滋阴清热"
-
-    if "便溏:腹泻" in symptom_str or "便溏:大便溏薄" in symptom_str:
-        if "饮食:食欲不振" in symptom_str:
-            return "脾虚湿盛证", "健脾祛湿"
-        return "寒湿证", "温中散寒，健脾化湿"
-
-    if "睡眠:失眠" in symptom_str or "睡眠:难入睡" in symptom_str:
-        if "口渴:口干" in symptom_str:
-            return "心肾不交证", "滋阴降火，交通心肾"
-        return "心脾两虚证", "补益心脾"
-
-    return "需进一步辨证", "根据辨证结果确定治则"
 
 
 def generator_node(state: AgentState, retriever: RAGRetriever, user_name: str = "匿名") -> AgentState:

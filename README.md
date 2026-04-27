@@ -8,10 +8,12 @@
 
 - 用户注册和登录：未登录时可浏览首页，开始问诊时弹出登录/注册窗口。
 - 短期记忆：登录用户的近期问诊内容会保存到账号中，新会话可作为上下文参考。
+- 历史就诊记录：登录后可直接查看当前账号下的历史问诊、症状摘要和诊断摘要。
 - 意图识别：首轮及后续关键表达会识别用户意图，例如初诊、复诊、快速咨询、单症状咨询、处方诉求等。
 - 症状采集：支持用户自然语言描述症状，并通过十问维度补充信息。
 - 交互确认：系统会根据用户选择生成确认问题，减少关键信息缺失。
 - RAG 检索：结合中医知识库检索相关内容，辅助追问和生成诊断结论。
+- 规则验证：诊断生成会结合规则引擎和诊断验证 Agent，输出结构化校验提示。
 - 诊断结论生成：根据采集信息输出结构化报告，包括基本信息、主诉、现病史、十问歌、辨证、治则和建议。
 
 ## 使用介绍
@@ -48,6 +50,8 @@
 ```text
 嗓子痛
 ```
+
+登录后也可以点击右上角“历史”按钮，直接查看当前账号下之前的问诊记录。历史面板会展示就诊时间、症状标签、首条主诉、诊断摘要和验证置信度，方便用户基于既往记录继续问诊。
 
 ### 4. 补充或修正症状
 
@@ -134,6 +138,45 @@ predoc_ai/
 └── README.md
 ```
 
+## Agent 架构
+
+当前后端流程按以下职责拆分：
+
+```text
+前端/UI
+   ↓
+用户消息队列 message_queue.py
+   ↓
+意图识别 Agent intention_agent.py
+   ↓
++--------------------------+-------------------------------+
+|                          |                               |
+症状收集 Agent             复诊/历史记忆 Agent
+options_node.py            memory_agent.py
+inquiry_node.py            auth.py 本地记忆存储
+|                          |
+RAG 症状检索 Agent          历史记录 API
+symptom_rag_agent.py        GET /api/consultation/history
+   ↓
+诊断生成 Agent generator_node.py
+   ↔
+规则引擎/专家系统 rules_engine.py
+   ↔
+诊断验证 Agent diagnosis_validator.py
+   ↓
+输出报告
+   ↓
+增量经验存储 append_experience_event
+```
+
+其中：
+
+- `message_queue.py`：按会话管理用户消息，隔离 API 输入和 Agent 处理。
+- `memory_agent.py`：读取用户短期记忆和经验摘要，识别复诊/延续咨询，并在合适时将历史症状回填到当前会话。
+- `symptom_rag_agent.py`：统一构造症状、意图、任务相关的 RAG 检索 query。
+- `rules_engine.py`：提供保守的规则初判、缺失维度和风险提示。
+- `diagnosis_validator.py`：检查报告结构、潜在未采集信息断言，并追加验证摘要。
+
 ## 本地运行
 
 ### 1. 后端配置
@@ -215,12 +258,13 @@ VITE_API_TARGET=http://127.0.0.1:8001 npm run dev -- --host 127.0.0.1 --port 300
 - `POST /api/consultation/start`：创建问诊会话，需要登录
 - `POST /api/consultation/{thread_id}/message`：发送问诊消息，需要登录
 - `GET /api/consultation/{thread_id}/case`：获取诊断结论，需要登录
+- `GET /api/consultation/history`：获取当前登录用户的历史就诊记录，需要登录
 
 ## 数据与安全
 
 - 用户密码使用 PBKDF2 哈希保存，不保存明文密码。
 - 登录 token 使用 `AUTH_SECRET` 签名。
-- 短期记忆默认保存到本地 `storage/auth_store.json`。
+- 短期记忆、历史就诊事件和增量经验默认保存到本地 `storage/auth_store.json`。
 - `.env`、`storage/`、向量库和本地数据目录已加入 `.gitignore`。
 - 生产环境建议接入正式数据库和密钥管理服务，不建议长期使用本地 JSON 文件作为用户系统存储。
 

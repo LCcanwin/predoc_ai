@@ -8,6 +8,7 @@ from langchain_core.callbacks import AsyncCallbackHandler
 from .state import AgentState, TEN_INQUIRY_DIMENSIONS, DIMENSION_DESCRIPTIONS
 from .rag_retriever import RAGRetriever
 from .intention_agent import IntentionType
+from .symptom_rag_agent import retrieve_symptom_context
 from ..config import get_llm_config
 
 
@@ -116,19 +117,8 @@ def generate_inquiry_message(state: AgentState, retriever: RAGRetriever) -> AIMe
         missing_formatted.append(f"- {dim}：{desc}")
     missing_str = "\n".join(missing_formatted) if missing_formatted else "所有维度已收集完毕"
 
-    # Get relevant knowledge from RAG
-    task_terms = {
-        IntentionType.SPECIFIC_SYMPTOM: "单一症状辨证 重点追问",
-        IntentionType.QUICK_CONSULT: "快速问诊 关键症状",
-        IntentionType.GET_PRESCRIPTION: "处方 治法 用药前问诊",
-        IntentionType.FOLLOW_UP: "复诊 用药反馈",
-        IntentionType.CLARIFY_DOUBT: "解释 辨证依据",
-    }.get(user_intention, "十问歌 症状收集")
-    mentioned_terms = " ".join(intention_info.get("mentioned_symptoms", [])[:5])
-    dimension_terms = " ".join([s.get("dimension", "") for s in symptoms_list[:3]])
-    query = f"中医问诊 {task_terms} {mentioned_terms} {dimension_terms}".strip()
-    retrieved_docs = retriever.retrieve(query)
-    knowledge_context = retriever.format_retrieved_docs(retrieved_docs[:3])
+    # Get relevant knowledge from the symptom RAG agent.
+    _, knowledge_context = retrieve_symptom_context(state, retriever, task="inquiry", limit=3)
 
     # Adapt prompt based on intention
     intention_instruction = ""
@@ -203,32 +193,8 @@ def retrieve_knowledge_for_context(state: AgentState, retriever: RAGRetriever) -
     Returns:
         Formatted knowledge context
     """
-    symptoms_list = state.get("symptoms_list", [])
-    user_intention = state.get("user_intention", "")
-    intention_info = state.get("intention_info", {})
-
-    # Build query based on context
-    query_parts = []
-
-    # Add mentioned symptoms
-    for symptom in symptoms_list[-3:]:
-        dim = symptom.get("dimension", "")
-        value = symptom.get("value", "")
-        if value and value not in ["无", "未提及"]:
-            query_parts.append(f"{dim} {value}")
-
-    query_parts.extend(intention_info.get("mentioned_symptoms", [])[:5])
-
-    # Add intention context
-    if user_intention == IntentionType.SPECIFIC_SYMPTOM:
-        query_parts.append("单一症状辨证")
-    elif user_intention == IntentionType.GET_PRESCRIPTION:
-        query_parts.append("处方 治法")
-
-    query = "中医 " + " ".join(query_parts) if query_parts else "中医问诊"
-
-    docs = retriever.retrieve(query)
-    return retriever.format_retrieved_docs(docs[:4])
+    _, context = retrieve_symptom_context(state, retriever, task="inquiry", limit=4)
+    return context
 
 
 def inquiry_node(state: AgentState, retriever: RAGRetriever) -> AgentState:

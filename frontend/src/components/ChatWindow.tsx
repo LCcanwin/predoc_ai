@@ -2,7 +2,7 @@ import React, { useState, useRef, useEffect } from 'react'
 import { MessageBubble } from './MessageBubble'
 import { CaseOutput } from './CaseOutput'
 import { useChatStream } from '../hooks/useChatStream'
-import { api, type User } from '../services/api'
+import { api, type ConsultationRecord, type User } from '../services/api'
 
 interface Message {
   id: string
@@ -38,6 +38,9 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({ token, user, onRequireAu
   const [isGeneratingCase, setIsGeneratingCase] = useState(false)
   const [pendingOptions, setPendingOptions] = useState<number[] | null>(null)
   const [pendingConfirm, setPendingConfirm] = useState<string[] | null>(null)
+  const [showHistory, setShowHistory] = useState(false)
+  const [historyRecords, setHistoryRecords] = useState<ConsultationRecord[]>([])
+  const [isLoadingHistory, setIsLoadingHistory] = useState(false)
 
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const { sendMessage, startConsultation } = useChatStream(token)
@@ -188,6 +191,24 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({ token, user, onRequireAu
     handleSendWithInput(input.trim())
   }
 
+  const handleOpenHistory = async () => {
+    if (!token) {
+      onRequireAuth()
+      return
+    }
+    setShowHistory(true)
+    setIsLoadingHistory(true)
+    try {
+      const data = await api.getHistory(token)
+      setHistoryRecords(data.records)
+    } catch (error) {
+      console.error('Failed to load history:', error)
+      setHistoryRecords([])
+    } finally {
+      setIsLoadingHistory(false)
+    }
+  }
+
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault()
@@ -213,6 +234,7 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({ token, user, onRequireAu
           <span className="status-dot"></span>
           {user ? user.username : '未登录'}
         </div>
+        <button className="logout-button" onClick={handleOpenHistory}>历史</button>
         {user ? (
           <button className="logout-button" onClick={onLogout}>退出</button>
         ) : (
@@ -277,6 +299,46 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({ token, user, onRequireAu
 
         <div ref={messagesEndRef} />
       </div>
+
+      {showHistory && (
+        <div className="history-panel">
+          <div className="history-header">
+            <div>
+              <div className="history-title">历史就诊记录</div>
+              <div className="history-subtitle">基于当前登录账号读取</div>
+            </div>
+            <button className="history-close" onClick={() => setShowHistory(false)}>×</button>
+          </div>
+
+          <div className="history-list">
+            {isLoadingHistory && <div className="history-empty">正在读取历史记录...</div>}
+            {!isLoadingHistory && historyRecords.length === 0 && (
+              <div className="history-empty">暂无历史记录</div>
+            )}
+            {!isLoadingHistory && historyRecords.map((record) => (
+              <div className="history-item" key={record.thread_id}>
+                <div className="history-item-top">
+                  <span>{record.updated_at ? new Date(record.updated_at).toLocaleString() : '未知时间'}</span>
+                  {record.validation_confidence != null && (
+                    <span>置信度 {record.validation_confidence}</span>
+                  )}
+                </div>
+                <div className="history-symptoms">
+                  {record.symptoms.slice(0, 6).map((item, index) => (
+                    <span key={`${item.dimension}-${index}`}>{item.dimension}: {item.value}</span>
+                  ))}
+                </div>
+                {record.messages[0]?.user_message && (
+                  <div className="history-text">主诉：{record.messages[0].user_message}</div>
+                )}
+                {record.diagnosis_summary && (
+                  <div className="history-text">结论：{record.diagnosis_summary.slice(0, 180)}</div>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       <div className="input-container">
         <div className="input-wrapper">

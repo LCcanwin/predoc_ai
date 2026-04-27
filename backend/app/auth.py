@@ -169,7 +169,7 @@ def get_memory_context(user_id: str) -> str:
     lines = []
     for event in events:
         user_text = event.get("user_message", "")
-        assistant_text = event.get("assistant_message", "")
+        assistant_text = event.get("assistant_summary") or event.get("assistant_message", "")
         symptoms = event.get("symptoms", [])
         symptom_text = "、".join(
             f"{item.get('dimension')}:{item.get('value')}"
@@ -186,6 +186,85 @@ def get_memory_context(user_id: str) -> str:
         if parts:
             lines.append("；".join(parts))
     return "\n".join(lines)
+
+
+def get_memory_snapshot(user_id: str) -> dict:
+    """Return raw short-term memory and experience items for memory agents."""
+    user = get_user_by_id(user_id)
+    if not user:
+        return {"events": [], "experiences": []}
+    memory = user.get("memory", {})
+    return {
+        "events": list(memory.get("events", [])),
+        "experiences": list(memory.get("experiences", [])),
+    }
+
+
+def get_consultation_records(user_id: str, limit: int = 20) -> list[dict]:
+    """Return user-facing previous consultation records."""
+    snapshot = get_memory_snapshot(user_id)
+    events = snapshot.get("events", [])
+    experiences = snapshot.get("experiences", [])
+
+    experience_by_thread = {
+        item.get("thread_id"): item
+        for item in experiences
+        if item.get("thread_id")
+    }
+
+    grouped: dict[str, dict] = {}
+    for event in events:
+        thread_id = event.get("thread_id")
+        if not thread_id:
+            continue
+        record = grouped.setdefault(thread_id, {
+            "thread_id": thread_id,
+            "created_at": event.get("created_at"),
+            "updated_at": event.get("created_at"),
+            "messages": [],
+            "symptoms": [],
+            "diagnosis_summary": "",
+            "validation_confidence": None,
+        })
+        record["updated_at"] = event.get("created_at") or record["updated_at"]
+        record["messages"].append({
+            "user_message": event.get("user_message", ""),
+            "assistant_summary": event.get("assistant_summary") or event.get("assistant_message", "")[:180],
+            "created_at": event.get("created_at"),
+        })
+        for symptom in event.get("symptoms", []):
+            dim = symptom.get("dimension")
+            value = symptom.get("value")
+            if not dim or not value:
+                continue
+            if not any(item.get("dimension") == dim and item.get("value") == value for item in record["symptoms"]):
+                record["symptoms"].append({"dimension": dim, "value": value})
+
+    for thread_id, experience in experience_by_thread.items():
+        record = grouped.setdefault(thread_id, {
+            "thread_id": thread_id,
+            "created_at": experience.get("created_at"),
+            "updated_at": experience.get("created_at"),
+            "messages": [],
+            "symptoms": [],
+            "diagnosis_summary": "",
+            "validation_confidence": None,
+        })
+        record["diagnosis_summary"] = experience.get("diagnosis_summary", "")
+        record["validation_confidence"] = experience.get("validation_confidence")
+        if experience.get("symptom_summary") and not record["symptoms"]:
+            record["symptoms"] = [
+                {"dimension": part.split("：", 1)[0], "value": part.split("：", 1)[1]}
+                for part in experience["symptom_summary"].split("；")
+                if "：" in part
+            ]
+
+    records = sorted(
+        grouped.values(),
+        key=lambda item: item.get("updated_at") or item.get("created_at") or "",
+        reverse=True,
+    )
+    return records[:limit]
 
 
 def append_memory_event(user_id: str, thread_id: str, user_message: str, assistant_message: str, symptoms: list[dict]) -> None:
@@ -206,8 +285,68 @@ def append_memory_event(user_id: str, thread_id: str, user_message: str, assista
             "thread_id": thread_id,
             "created_at": _utc_now().isoformat(),
             "user_message": user_message,
-            "assistant_message": assistant_message,
+            "assistant_message": assistant_message[:1200],
+            "assistant_summary": _summarize_assistant_message(assistant_message),
             "symptoms": symptoms[-10:],
         })
         memory["events"] = events[-MAX_MEMORY_EVENTS:]
+        _save_store(store)
+
+
+def _summarize_assistant_message(message: str) -> str:
+    """Keep memory compact and focused on reusable clinical context."""
+    if not message:
+        return ""
+    lines = []
+    for raw_line in message.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if any(marker in line for marker in ["已记录", "已收集", "诊断", "辨证", "治则", "建议", "确认"]):
+            lines.append(line)
+        if len("；".join(lines)) > 220:
+            break
+    return "；".join(lines)[:260] if lines else message[:180]
+
+
+def append_experience_event(
+    user_id: str,
+    thread_id: str,
+    symptoms: list[dict],
+    case_text: str,
+    validation: Optional[dict] = None,
+) -> None:
+    """Persist compact final-case experience for future follow-up retrieval."""
+    symptom_summary = "；".join(
+        f"{item.get('dimension')}：{item.get('value')}"
+        for item in symptoms
+        if item.get("dimension") and item.get("value") not in ["", "待确认", "待进一步确认"]
+    )
+
+    diagnosis_summary = ""
+    for marker in ["## 辨证", "## 治则", "## 诊断验证"]:
+        if marker in case_text:
+            diagnosis_summary += case_text.split(marker, 1)[1][:240] + " "
+
+    with _lock:
+        store = _load_store()
+        target_key = None
+        for key, user in store["users"].items():
+            if user.get("id") == user_id:
+                target_key = key
+                break
+        if target_key is None:
+            return
+
+        user = store["users"][target_key]
+        memory = user.setdefault("memory", {"events": []})
+        experiences = memory.setdefault("experiences", [])
+        experiences.append({
+            "thread_id": thread_id,
+            "created_at": _utc_now().isoformat(),
+            "symptom_summary": symptom_summary,
+            "diagnosis_summary": diagnosis_summary.strip(),
+            "validation_confidence": (validation or {}).get("confidence"),
+        })
+        memory["experiences"] = experiences[-MAX_MEMORY_EVENTS:]
         _save_store(store)
