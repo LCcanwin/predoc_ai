@@ -45,6 +45,9 @@ class AgentState(TypedDict):
     memory_agent: dict
     """Structured memory and follow-up signals."""
 
+    session_summary: str
+    """Compact summary of earlier messages in the current session."""
+
     rule_context: dict
     """Rule-engine diagnosis hints."""
 

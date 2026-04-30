@@ -39,12 +39,100 @@ _sessions: Dict[str, dict] = {}
 _executor = ThreadPoolExecutor(max_workers=4)
 _retriever = None
 _message_queue = UserMessageQueue()
+SESSION_MESSAGE_WINDOW = 12
+SESSION_COMPACT_TRIGGER = 16
+SESSION_SUMMARY_MAX_CHARS = 1800
 
 
 def strip_think_tags(content: str) -> str:
     """Remove <think>...</think> tags from LLM response content."""
     content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL | re.IGNORECASE)
     return content.strip()
+
+
+def _message_role(msg) -> str:
+    if getattr(msg, "type", None) == "human":
+        return "患者"
+    if getattr(msg, "type", None) == "ai":
+        return "助手"
+    return "系统"
+
+
+def _message_text(msg) -> str:
+    if not hasattr(msg, "content") or not msg.content:
+        return ""
+    return strip_think_tags(str(msg.content)).strip()
+
+
+def _compact_text(text: str, limit: int) -> str:
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "..."
+
+
+def _summarize_messages_for_context(messages: list, symptoms_list: list[dict]) -> str:
+    """Build a deterministic clinical summary for messages leaving the live window."""
+    lines = []
+    user_points = []
+    assistant_points = []
+    safety_points = []
+    red_flag_terms = ["呼吸困难", "胸痛", "高热", "便血", "意识不清", "剧烈"]
+
+    for msg in messages:
+        content = _message_text(msg)
+        if not content:
+            continue
+        role = _message_role(msg)
+        compact = _compact_text(content, 180 if role == "患者" else 220)
+        if role == "患者":
+            user_points.append(compact)
+        elif any(marker in compact for marker in ["已记录", "已收集", "确认", "诊断", "辨证", "治则", "建议"]):
+            assistant_points.append(compact)
+        for term in red_flag_terms:
+            if term in content and term not in safety_points:
+                safety_points.append(term)
+
+    confirmed = []
+    for item in symptoms_list:
+        dim = item.get("dimension")
+        value = item.get("value")
+        if dim and value and value not in ["", "待确认", "待进一步确认", "未记录"]:
+            confirmed.append(f"{dim}:{value}")
+
+    if user_points:
+        lines.append("患者早期补充：" + "；".join(user_points[-8:]))
+    if confirmed:
+        lines.append("当前已确认症状：" + "、".join(confirmed[-12:]))
+    if assistant_points:
+        lines.append("助手早期结论/确认：" + "；".join(assistant_points[-6:]))
+    if safety_points:
+        lines.append("早期安全信号：" + "、".join(safety_points))
+
+    return "\n".join(lines)
+
+
+def _merge_session_summary(existing_summary: str, new_summary: str) -> str:
+    parts = [part for part in [existing_summary.strip(), new_summary.strip()] if part]
+    merged = "\n".join(parts)
+    if len(merged) <= SESSION_SUMMARY_MAX_CHARS:
+        return merged
+    return merged[-SESSION_SUMMARY_MAX_CHARS:].lstrip()
+
+
+def _compact_session_context(session: dict) -> None:
+    """Keep a bounded recent message window plus a compact current-session summary."""
+    messages = session.get("messages", [])
+    if len(messages) <= SESSION_COMPACT_TRIGGER:
+        return
+
+    split_at = max(0, len(messages) - SESSION_MESSAGE_WINDOW)
+    older_messages = messages[:split_at]
+    recent_messages = messages[split_at:]
+    new_summary = _summarize_messages_for_context(older_messages, session.get("symptoms_list", []))
+
+    session["session_summary"] = _merge_session_summary(session.get("session_summary", ""), new_summary)
+    session["messages"] = recent_messages
 
 
 def _get_retriever():
@@ -82,6 +170,7 @@ async def start_consultation(request: dict, current_user: dict = Depends(get_cur
         "intention_info": {},
         "memory_context": memory_context,
         "memory_agent": memory,
+        "session_summary": "",
     }
 
     _sessions[thread_id] = session
@@ -363,6 +452,7 @@ def _process_turn_sync(messages: list, symptoms_list: list, thread_id: str, sess
                 "intention_info": session_data.get("intention_info", {}),
                 "memory_context": session_data.get("memory_context", ""),
                 "memory_agent": session_data.get("memory_agent", {}),
+                "session_summary": session_data.get("session_summary", ""),
                 "retrieved_context": "",
             }
 
@@ -570,6 +660,7 @@ async def send_message(thread_id: str, request: dict, current_user: dict = Depen
                 else:
                     cleaned_messages.append(msg)
             session["messages"] = cleaned_messages
+            _compact_session_context(session)
 
             session["is_complete"] = is_complete
 
@@ -635,11 +726,15 @@ async def get_case(thread_id: str, current_user: dict = Depends(get_current_user
         "intention_info": session.get("intention_info", {}),
         "memory_context": session.get("memory_context", ""),
         "memory_agent": session.get("memory_agent", {}),
+        "session_summary": session.get("session_summary", ""),
         "retrieved_context": "",
     }
 
     case_text = sanitize_case_text(strip_think_tags(generate_case_text(state, retriever, session.get("user_name", "匿名"))))
-    validation = validate_diagnosis_report(case_text, session.get("symptoms_list", []), session.get("messages", []))
+    validation_messages = session.get("messages", [])
+    if session.get("session_summary"):
+        validation_messages = [AIMessage(content=session["session_summary"])] + validation_messages
+    validation = validate_diagnosis_report(case_text, session.get("symptoms_list", []), validation_messages)
     if not session.get("experience_saved"):
         append_experience_event(
             current_user["id"],

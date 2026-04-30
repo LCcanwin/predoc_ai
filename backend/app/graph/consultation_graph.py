@@ -128,6 +128,7 @@ def run_consultation(
         "retrieved_context": "",
         "memory_context": "",
         "memory_agent": {},
+        "session_summary": "",
         "rule_context": {},
         "validation_context": {},
     }

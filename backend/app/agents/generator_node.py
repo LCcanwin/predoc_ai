@@ -97,6 +97,38 @@ def create_generator_llm(temperature: float = 0.5):
     )
 
 
+def _format_recent_conversation(messages: list) -> str:
+    lines = []
+    for msg in messages:
+        if hasattr(msg, "content") and msg.content:
+            role = "患者" if hasattr(msg, "type") and msg.type == "human" else "助手"
+            lines.append(f"{role}：{msg.content}")
+    return "\n".join(lines)
+
+
+def _build_generation_context(messages: list, session_summary: str = "", max_chars: int = 2000) -> str:
+    """Combine compressed session history with the latest turns, preserving the tail."""
+    recent_context = _format_recent_conversation(messages)
+    sections = []
+    if session_summary:
+        sections.append(f"【本次早期会话摘要】\n{session_summary}")
+    if recent_context:
+        sections.append(f"【最近对话】\n{recent_context}")
+
+    context = "\n\n".join(sections)
+    if len(context) <= max_chars:
+        return context
+
+    if session_summary:
+        summary_budget = min(len(session_summary), max_chars // 2)
+        summary_part = session_summary[-summary_budget:].lstrip()
+        recent_budget = max_chars - summary_budget - 18
+        recent_part = recent_context[-recent_budget:].lstrip() if recent_budget > 0 else ""
+        return f"【本次早期会话摘要】\n{summary_part}\n\n【最近对话】\n{recent_part}".strip()
+
+    return context[-max_chars:].lstrip()
+
+
 def generate_case_text(state: AgentState, retriever: RAGRetriever, user_name: str = "匿名") -> str:
     """
     Generate a structured TCM case from collected symptoms using LLM.
@@ -114,18 +146,17 @@ def generate_case_text(state: AgentState, retriever: RAGRetriever, user_name: st
     user_intention = state.get("user_intention", IntentionType.FIRST_VISIT)
     intention_info = state.get("intention_info", {})
     memory_context = state.get("memory_context", "")
+    session_summary = state.get("session_summary", "")
     retrieved_context = state.get("retrieved_context", "")
-    rule_context = build_rule_context(symptoms_list, messages)
+    rule_messages = messages
+    if session_summary:
+        rule_messages = [AIMessage(content=session_summary)] + messages
+    rule_context = build_rule_context(symptoms_list, rule_messages)
 
     # Format ten inquiry section
     ten_inquiry = format_ten_inquiry_for_case(symptoms_list)
 
-    # Get conversation context
-    conversation_context = ""
-    for msg in messages:
-        if hasattr(msg, "content") and msg.content:
-            role = "患者" if hasattr(msg, "type") and msg.type == "human" else "助手"
-            conversation_context += f"{role}：{msg.content}\n"
+    conversation_context = _build_generation_context(messages, session_summary, max_chars=2200)
 
     # Get relevant knowledge from the symptom RAG agent.
     _, knowledge_context = retrieve_symptom_context(state, retriever, task="generation", limit=5)
@@ -148,16 +179,16 @@ def generate_case_text(state: AgentState, retriever: RAGRetriever, user_name: st
         # Adapt generation based on intention
         if user_intention == IntentionType.QUICK_CONSULT:
             case_text = _generate_quick_consultation(symptoms_list, conversation_context, knowledge_context, user_name)
-            return _finalize_case_text(case_text, symptoms_list, messages)
+            return _finalize_case_text(case_text, symptoms_list, rule_messages)
         elif user_intention == IntentionType.SPECIFIC_SYMPTOM:
             case_text = _generate_specific_symptom_response(symptoms_list, conversation_context, knowledge_context)
-            return _finalize_case_text(case_text, symptoms_list, messages)
+            return _finalize_case_text(case_text, symptoms_list, rule_messages)
         elif user_intention == IntentionType.GET_PRESCRIPTION:
             case_text = _generate_prescription_suggestion(symptoms_list, conversation_context, knowledge_context)
-            return _finalize_case_text(case_text, symptoms_list, messages)
+            return _finalize_case_text(case_text, symptoms_list, rule_messages)
         elif needs_optimization:
             case_text = _optimize_case(symptoms_list, previous_case, knowledge_context)
-            return _finalize_case_text(case_text, symptoms_list, messages)
+            return _finalize_case_text(case_text, symptoms_list, rule_messages)
 
         # Standard full case generation
         prompt = f"""作为资深中医专家，请根据以下症状信息生成一份标准化的诊断结论。
@@ -166,7 +197,7 @@ def generate_case_text(state: AgentState, retriever: RAGRetriever, user_name: st
 {ten_inquiry}
 
 【问诊对话摘要】
-{conversation_context[:1500]}
+{_build_generation_context(messages, session_summary, max_chars=1500)}
 
 【用户短期记忆】（仅作近期背景参考，不能替代本次问诊信息）
 {memory_context if memory_context else "无"}
@@ -214,13 +245,13 @@ def generate_case_text(state: AgentState, retriever: RAGRetriever, user_name: st
 7. 不要输出 <think> 标签或任何思考过程"""
 
         response = llm.invoke(prompt)
-        return _finalize_case_text(response.content, symptoms_list, messages)
+        return _finalize_case_text(response.content, symptoms_list, rule_messages)
 
     except Exception as e:
         print(f"LLM error: {e}")
         # Fallback to rule-based generation
         case_text = _generate_fallback_case(symptoms_list, user_name)
-        return _finalize_case_text(case_text, symptoms_list, messages)
+        return _finalize_case_text(case_text, symptoms_list, rule_messages)
 
 
 def _finalize_case_text(case_text: str, symptoms_list: list[dict], messages: list) -> str:
